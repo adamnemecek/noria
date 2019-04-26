@@ -65,22 +65,24 @@ pub(super) fn main<A: Authority + 'static>(
     descriptor: ControllerDescriptor,
     ctrl_rx: futures::sync::mpsc::UnboundedReceiver<Event>,
     cport: tokio::net::tcp::TcpListener,
-    log: slog::Logger,
     authority: Arc<A>,
     tx: futures::sync::mpsc::UnboundedSender<Event>,
 ) -> impl Future<Item = (), Error = ()> {
+    let span = info_span!("controller");
     let (dtx, drx) = futures::sync::mpsc::unbounded();
 
-    tokio::spawn(listen_domain_replies(valve, log.clone(), dtx, cport));
+    tokio::spawn(
+        listen_domain_replies(dtx, valve.wrap(cport.incoming()))
+            .map_err(|e| {
+                warn!({ err = e }, "domain reply connection failed");
+            })
+            .instrument(span),
+    );
 
     // note that we do not start up the data-flow until we find a controller!
 
     let campaign = instance_campaign(tx.clone(), authority.clone(), descriptor, config);
-
-    let log = log;
     let authority = authority.clone();
-
-    let log2 = log.clone();
     let authority2 = authority.clone();
 
     // state that this instance will take if it becomes the controller
@@ -95,6 +97,7 @@ pub(super) fn main<A: Authority + 'static>(
                         unimplemented!();
                     }
                     CoordinationPayload::CreateUniverse(universe) => {
+                        debug!({ id = universe["id"] }, "asked to create universe");
                         if let Some(ref mut ctrl) = controller {
                             crate::block_on(|| ctrl.create_universe(universe).unwrap());
                         }
@@ -104,6 +107,10 @@ pub(super) fn main<A: Authority + 'static>(
                         ref read_listen_addr,
                         ..
                     } => {
+                        debug!(
+                            { addr = tokio_trace::field::debug(addr) },
+                            "new worker registered"
+                        );
                         if let Some(ref mut ctrl) = controller {
                             crate::block_on(|| {
                                 ctrl.handle_register(&msg, addr, read_listen_addr.clone())
@@ -112,6 +119,7 @@ pub(super) fn main<A: Authority + 'static>(
                         }
                     }
                     CoordinationPayload::Heartbeat => {
+                        trace!("worker heartbeat");
                         if let Some(ref mut ctrl) = controller {
                             crate::block_on(|| ctrl.handle_heartbeat(&msg).unwrap());
                         }
@@ -119,17 +127,20 @@ pub(super) fn main<A: Authority + 'static>(
                     _ => unreachable!(),
                 },
                 Event::ExternalRequest(method, path, query, body, reply_tx) => {
+                    let span = debug_span!({ path = path }, "external request");
                     if let Some(ref mut ctrl) = controller {
                         let authority = &authority;
                         let reply = crate::block_on(|| {
-                            ctrl.external_request(method, path, query, body, &authority)
+                            span.enter(|| {
+                                ctrl.external_request(method, path, query, body, &authority)
+                            })
                         });
 
                         if reply_tx.send(reply).is_err() {
-                            warn!(log, "client hung up");
+                            span.enter(|| warn!("client hung up"));
                         }
                     } else if reply_tx.send(Err(StatusCode::NOT_FOUND)).is_err() {
-                        warn!(log, "client hung up for 404");
+                        span.enter(|| warn!("client hung up for 404"));
                     }
                 }
                 #[cfg(test)]
@@ -180,36 +191,29 @@ pub(super) fn main<A: Authority + 'static>(
             Ok(())
         })
         .map_err(|e| panic!("{:?}", e))
+        .instrument(span)
 }
 
 fn listen_domain_replies(
-    valve: &Valve,
-    log: slog::Logger,
     reply_tx: UnboundedSender<ControlReplyPacket>,
-    on: tokio::net::TcpListener,
-) -> impl Future<Item = (), Error = ()> {
-    let valve = valve.clone();
-    valve
-        .wrap(on.incoming())
-        .map_err(failure::Error::from)
-        .for_each(move |sock| {
-            tokio::spawn(
-                valve
-                    .wrap(AsyncBincodeReader::from(sock))
-                    .map_err(failure::Error::from)
-                    .forward(
-                        reply_tx
-                            .clone()
-                            .sink_map_err(|_| format_err!("main event loop went away")),
-                    )
-                    .map(|_| ())
-                    .map_err(|e| panic!("{:?}", e)),
-            );
-            Ok(())
-        })
-        .map_err(move |e| {
-            warn!(log, "domain reply connection failed: {:?}", e);
-        })
+    on: Valved<tokio::net::tcp::Incoming>,
+) -> impl Future<Item = (), Error = failure::Error> {
+    on.map_err(failure::Error::from).for_each(move |sock| {
+        tokio::spawn(
+            valve
+                .wrap(AsyncBincodeReader::from(sock))
+                .map_err(failure::Error::from)
+                .forward(
+                    reply_tx
+                        .clone()
+                        .sink_map_err(|_| format_err!("main event loop went away")),
+                )
+                .map(|_| ())
+                .map_err(|e| panic!("{:?}", e))
+                .instrument(debug_span!("domain_replies")),
+        );
+        Ok(())
+    })
 }
 
 fn instance_campaign<A: Authority + 'static>(
